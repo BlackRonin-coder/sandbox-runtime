@@ -42,6 +42,7 @@ const ALLOWLIST_DENY = [
 import {
   peekForClientHello,
   terminateAndForward,
+  type TunnelTimeouts,
 } from './tls-terminate-proxy.js'
 import {
   prepareBodySubstitution,
@@ -354,7 +355,9 @@ export interface HttpProxyServerOptions {
    * terminated is accepted, before its first bytes are seen, and held until
    * the tunnel closes (an idle keep-alive tunnel holds one too), or until
    * the tunnel turns out not to carry TLS. So at the cap, a CONNECT that
-   * would have been tunnelled opaquely as non-TLS is refused too.
+   * would have been tunnelled opaquely as non-TLS is refused too. The
+   * refusal is logged and passed to onFilterRequestDenied with method CONNECT,
+   * once per command until half the slots are free again.
    * SandboxManager sets it from network.tlsTerminate.maxTunnels.
    */
   maxTerminatedTunnels?: number
@@ -362,10 +365,22 @@ export interface HttpProxyServerOptions {
   /**
    * A tunnel to be TLS-terminated must finish its TLS handshake this long
    * after its CONNECT (default 10 s), or it is closed and its slot freed.
-   * A tunnel that finished its handshake is not timed out afterwards.
+   * Past its handshake, tunnelTimeouts apply.
    * SandboxManager sets it from network.tlsTerminate.handshakeTimeoutMs.
    */
   tlsHandshakeTimeoutMs?: number
+
+  /**
+   * When a TLS-terminated tunnel is closed, and its slot freed, past its
+   * handshake. Idle, with nothing queued for its client: with no whole
+   * request head yet (default 10 s), or none since its last response (6 s:
+   * the 5 s that `Keep-Alive: timeout` tells the client, and a margin of
+   * 1 s). Under way, with a request that is not all in or is held back for
+   * its upstream, or bytes queued for its client: once nothing has moved for
+   * 300 s. A whole request that waits for its response is not timed out.
+   * Primarily a test seam.
+   */
+  tunnelTimeouts?: Partial<TunnelTimeouts>
 
   /**
    * Bytes all of this proxy's connections together may hold for slow
@@ -408,6 +423,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       : {},
   )
   let terminatedTunnels = 0
+  /** The commands told of the tunnel cap in this burst of refusals. */
+  const toldOfCap = new Set<string | undefined>()
   const byteBudget =
     options.byteBudget ??
     createByteBudget(options.maxBufferedBytes ?? 256 << 20)
@@ -722,7 +739,29 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         // only terminate if it is one. Non-TLS falls through to the opaque
         // tunnel below — i.e. base-sandbox behaviour, hostname-allowlisted
         // but not content-inspected (same as the SOCKS path).
-        if (terminatedTunnels >= (options.maxTerminatedTunnels ?? 256)) {
+        const maxTunnels = options.maxTerminatedTunnels ?? 256
+        if (terminatedTunnels >= maxTunnels) {
+          // Of a refused CONNECT clients show the status at most, so that
+          // the limit is the sandbox's own is said where refusals are.
+          if (!toldOfCap.has(auth.encodedCommand)) {
+            // The client picks the name, so the names kept are bounded.
+            if (toldOfCap.size >= 100) toldOfCap.clear()
+            toldOfCap.add(auth.encodedCommand)
+            const reason =
+              `the sandbox's limit of ${maxTunnels} TLS-terminated tunnels at ` +
+              `once is reached; the limit is network.tlsTerminate.maxTunnels ` +
+              `in the sandbox's configuration`
+            logForDebugging(
+              `[proxy] CONNECT ${hostname}:${port} refused: ${reason}`,
+              { level: 'warn' },
+            )
+            options.onFilterRequestDenied?.({
+              method: 'CONNECT',
+              url: formatAuthority(hostname, port, 0),
+              reason,
+              encodedCommand: auth.encodedCommand,
+            })
+          }
           const mark = markFor('too_many_tunnels', 'too-many-tunnels')!
           const [name, value] =
             typeof mark === 'string'
@@ -741,6 +780,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           if (!slotHeld) return
           slotHeld = false
           terminatedTunnels--
+          if (terminatedTunnels * 2 <= maxTunnels) toldOfCap.clear()
         }
         let handshakeDone = (): boolean => false
         const deadline = setTimeout(() => {
@@ -790,6 +830,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               requestTargetAsSpelled: options.requestTargetAsSpelled,
               ambiguousRequestTarget: options.ambiguousRequestTarget,
               byteBudget,
+              timeouts: options.tunnelTimeouts,
               onEstablished: () => clearTimeout(deadline),
               onHandshakeProbe: isDone => {
                 handshakeDone = isDone
