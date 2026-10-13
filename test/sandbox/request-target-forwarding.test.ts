@@ -10,6 +10,7 @@ import {
 } from 'node:tls'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { PassThrough } from 'node:stream'
 import {
   createHttpProxyServer,
   type HttpProxyServerOptions,
@@ -18,6 +19,7 @@ import { createMitmCA } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
 import {
   readRequestTarget,
+  refuseUnparsedRequest,
   type RequestInfo,
 } from '../../src/sandbox/request-filter.js'
 import { SentinelRegistry } from '../../src/sandbox/credential-sentinel.js'
@@ -91,21 +93,29 @@ const AMBIGUOUS: Case[] = [
   ['//k%23', '/k%23'],
 ]
 
-// A fragment, alone and with each ambiguous kind.
-const FRAGMENT = [
-  '/a#frag',
-  '/a?x#frag',
-  '/#',
-  '/a?#',
-  '/a#?x',
-  '/a/../b#x',
-  '/a/%2e%2e/b#x',
-  '//k#x',
-  '/a\\b#x',
-  '/a\\b/../c#x',
-  '/a#/../b',
-  '/a%23b#x',
+// A fragment is cut off before anything is read: as sent, and what is left.
+const FRAGMENT: Case[] = [
+  ['/p#f', '/p'],
+  ['/p#', '/p'],
+  ['/p#f?q', '/p'],
+  ['/p?q#f', '/p?q'],
+  ['/p?#f', '/p?'],
+  ['/#f', '/'],
+  ['/p#f#g', '/p'],
+  ['/p%23a#f', '/p%23a'],
+  // What would be ambiguous in the path is not, in the fragment.
+  ['/p#/../x', '/p'],
+  ['/p#\\x', '/p'],
 ]
+
+// What is left is ambiguous as it would be without one: and normalized.
+const FRAGMENT_AMBIGUOUS = [
+  ['/a/../b#x', '/a/../b', '/b'],
+  ['/a/%2e%2e/b#x', '/a/%2e%2e/b', '/b'],
+  ['//k#x', '//k', '/k'],
+  ['/a\\b#x', '/a\\b', '/a/b'],
+  ['/a\\b/../c?q#x', '/a\\b/../c?q', '/a/c?q'],
+] as const
 
 // Not ambiguous: normalizing leaves them alone, or only escapes a character
 // or drops an empty query.
@@ -448,22 +458,44 @@ describe('request target forwarding', () => {
       expect(denied.map(d => d.reason)).toEqual(['malformed request-target'])
     })
 
-    // No client sends one, and an upstream may end the path at it or take
-    // it into the path: there is no spelling to keep and nothing to drop.
-    test.each(FRAGMENT)('%s is refused in every mode', async sent => {
-      const asked = hookSeen.length
+    // Some clients leave it in the absolute form they send a proxy. An
+    // upstream may end the path at it or take it into the path, so no mode
+    // sends it, and the hook judges what is sent.
+    test.each(FRAGMENT)('%s goes out as %s', async (sent, left) => {
       for (const mode of ['default', 'asSpelled', 'normalize'] as const) {
-        const reply = await send(hookPort[mode], sent)
-        expect(reply.status).toBe(400)
-        expect(reply.text).toContain('a request-target has no fragment')
-        expect(reply.text).not.toMatch(/ambiguous-request-target/i)
+        const { forwarded } = await send(hookPort[mode], sent)
+        const { url, info } = hookSeen.at(-1)!
+        expect(forwarded).toBe(
+          mode === 'normalize' ? info?.normalizedRequestTarget : left,
+        )
+        expect(info?.requestTarget).toBe(left)
+        expect(info?.requestTargetIsAmbiguous).toBe(false)
+        expect(url).not.toContain('#')
       }
-      expect(hookSeen.length).toBe(asked)
     })
+
+    test.each(FRAGMENT_AMBIGUOUS)(
+      '%s is judged as %s',
+      async (sent, left, normalized) => {
+        const refused = await send(hookPort.default, sent)
+        expect(refused.text).toMatch(
+          /^x-proxy-error: ambiguous-request-target\r$/im,
+        )
+        expect((await send(hookPort.asSpelled, sent)).forwarded).toBe(left)
+        expect(hookSeen.at(-1)!.info).toMatchObject({
+          requestTarget: left,
+          normalizedRequestTarget: normalized,
+          requestTargetIsAmbiguous: true,
+        })
+        expect((await send(hookPort.normalize, sent)).forwarded).toBe(
+          normalized,
+        )
+      },
+    )
 
     test.each([
       ['/a/../b?q=1', '/a/../b?q=1', 'ambiguous request-target'],
-      ['/a?q=1#x', '/a?q=1#x', 'malformed request-target: a request-target'],
+      ['/a/../b?q=1#x', '/a/../b?q=1', 'ambiguous request-target'],
     ])(
       'the refusal of %s is reported like a denial of the hook, and logged',
       async (sent, shown, reason) => {
@@ -516,11 +548,226 @@ describe('request target forwarding', () => {
           ? await sendPlain(port, '/x', 'http:///')
           : await sendTls(port, `http:///${UPSTREAM_NAME}/x`)
       expect(reply.status).toBe(400)
+      expect(reply.text).toMatch(
+        /^x-proxy-error: blocked-by-sandbox-runtime\r$/im,
+      )
       expect(denied).toHaveLength(1)
       expect(denied[0]!.url.replace(/\d+$/, '')).toBe(origin)
       expect(denied[0]!.reason).toBe('malformed request-target')
     },
   )
+
+  test.each(['default', 'asSpelled', 'normalize'] as const)(
+    'with a hook, %s: a fragment right after the authority leaves the root',
+    async mode => {
+      for (const rest of ['#x', '#x/y', '#', '#@other.test/x']) {
+        const reply = await sendPlain(hookPort[mode], rest)
+        expect([rest, reply.status, reply.forwarded]).toEqual([rest, 200, '/'])
+      }
+    },
+  )
+
+  // No request handler sees these: the runtime's HTTP parser gives up on
+  // them. Left to itself the tunnel would close without a word.
+  describe('a request the parser refuses, in a tunnel', () => {
+    const host = (): string => `Host: ${UPSTREAM_NAME}:${tlsPort}\r\n`
+    const ADVICE =
+      'malformed request-target: percent-encode its bytes outside printable ASCII'
+
+    /** Writes the chunks on a fresh tunnel; all it answers, once it closes. */
+    async function untilClosed(
+      proxyPort: number,
+      ...chunks: string[]
+    ): Promise<string> {
+      const tls = await tunnel(proxyPort)
+      const closed = new Promise<void>(r => tls.once('close', () => r()))
+      let reply = ''
+      tls.on('error', () => {})
+      tls.on('data', chunk => (reply += chunk.toString('latin1')))
+      for (const chunk of chunks) {
+        tls.write(Buffer.from(chunk, 'latin1'))
+        await new Promise(r => setTimeout(r, 50))
+      }
+      await closed
+      return reply
+    }
+
+    const reporting = (
+      extra: Partial<HttpProxyServerOptions> = {},
+    ): Promise<number> => {
+      denied.length = 0
+      return listen(
+        createHttpProxyServer({
+          ...base,
+          filterRequest: async (request, info) => {
+            hookSeen.push({ url: request.url, info })
+            return { action: 'allow' }
+          },
+          onFilterRequestDenied: d => denied.push(d),
+          ...extra,
+        }),
+      )
+    }
+
+    test.each([
+      ['/caf\xc3\xa9', '/caf%C3%A9'],
+      ['/x?q=caf\xc3\xa9&k=v#f', '/x?q=caf%C3%A9&k=v#f'],
+      ['/caf\xe9', '/caf%E9'],
+      ['/a\tb\x00c\x7f', '/a%09b%00c%7F'],
+    ])(
+      '%p is answered 400 with what to do, and reported as %s',
+      async (sent, shown) => {
+        const port = await reporting()
+        const [asked, arrived] = [hookSeen.length, tlsSeen.length]
+        const reply = await untilClosed(
+          port,
+          `POST ${sent} HTTP/1.1\r\n${host()}\r\n`,
+        )
+        expect(reply).toBe(
+          'HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n' +
+            'X-Proxy-Error: blocked-by-sandbox-runtime\r\n' +
+            `Content-Length: ${ADVICE.length + 1}\r\nConnection: close\r\n\r\n` +
+            `${ADVICE}\n`,
+        )
+        expect(denied).toEqual([
+          {
+            method: 'POST',
+            url: `https://${UPSTREAM_NAME}:${tlsPort}${shown}`,
+            reason: ADVICE,
+          },
+        ])
+        expect([hookSeen.length, tlsSeen.length]).toEqual([asked, arrived])
+      },
+    )
+
+    test.each([
+      ['a space in the target', `GET /a b HTTP/1.1\r\n`, ''],
+      ['a header name with a space', 'GET /a HTTP/1.1\r\n', 'Bad Name: x\r\n'],
+      ['a control byte in a header', 'GET /a HTTP/1.1\r\n', 'X: a\x01b\r\n'],
+      ['a method it does not know', 'FROB /a HTTP/1.1\r\n', ''],
+      [
+        'two lengths',
+        'POST /a HTTP/1.1\r\n',
+        'Content-Length: 1\r\n'.repeat(2),
+      ],
+      [
+        'a head too long',
+        'GET /a HTTP/1.1\r\n',
+        `X: ${'y'.repeat(200000)}\r\n`,
+      ],
+    ])('%s: 400, and only the tunnel is named', async (_what, line, header) => {
+      const port = await reporting()
+      const reply = await untilClosed(port, `${line}${host()}${header}\r\n`)
+      expect(reply).toStartWith('HTTP/1.1 400 Bad Request\r\n')
+      expect(reply).toMatch(
+        /\r\n\r\nmalformed request \(Parse Error: [ -~]+\)\n$/,
+      )
+      expect(reply.match(/HTTP\/1\.1 /g)).toHaveLength(1)
+      expect(denied).toHaveLength(1)
+      expect(denied[0]).toMatchObject({
+        method: '-',
+        url: `https://${UPSTREAM_NAME}:${tlsPort}`,
+      })
+      expect(denied[0]!.reason).toStartWith('malformed request (Parse Error: ')
+    })
+
+    test('it is answered whoever listens, and without a hook, and the tunnel ends at once', async () => {
+      for (const port of [hookPort.default, noHookPort]) {
+        const began = Date.now()
+        expect(
+          await untilClosed(port, `GET /\xc3\xa9 HTTP/1.1\r\n${host()}\r\n`),
+        ).toEndWith(`${ADVICE}\n`)
+        expect(Date.now() - began).toBeLessThan(700)
+      }
+    })
+
+    test('a proxy that marks its refusals marks this one', async () => {
+      const port = await reporting({ denyHeader: 'X-Deny-Reason' })
+      const reply = await untilClosed(
+        port,
+        `GET /\xc3\xa9 HTTP/1.1\r\n${host()}\r\n`,
+      )
+      expect(reply).toContain('\r\nX-Deny-Reason: bad_request\r\n')
+      expect(reply).not.toMatch(/x-proxy-error/i)
+    })
+
+    test('it leaves a warn-level debug line', async () => {
+      const warn = spyOn(console, 'warn').mockImplementation(() => {})
+      const error = spyOn(console, 'error').mockImplementation(() => {})
+      process.env.SRT_DEBUG = '1'
+      try {
+        await untilClosed(
+          hookPort.default,
+          `GET /\xc3\xa9 HTTP/1.1\r\n${host()}\r\n`,
+        )
+        expect(warn.mock.calls.flat().join('\n')).toContain(ADVICE)
+      } finally {
+        delete process.env.SRT_DEBUG
+        warn.mockRestore()
+        error.mockRestore()
+      }
+    })
+
+    test('after an answered request it is answered in its turn', async () => {
+      const port = await reporting()
+      const reply = await untilClosed(
+        port,
+        `GET /ok HTTP/1.1\r\n${host()}\r\n`,
+        `GET /\xc3\xa9 HTTP/1.1\r\n${host()}\r\n`,
+      )
+      expect(reply.match(/HTTP\/1\.1 \d+/g)).toEqual([
+        'HTTP/1.1 200',
+        'HTTP/1.1 400',
+      ])
+      expect(denied.map(d => d.url)).toEqual([
+        `https://${UPSTREAM_NAME}:${tlsPort}/%C3%A9`,
+      ])
+    })
+
+    // The 400 would be read as the answer to the request before it.
+    test('behind a request still being answered, nothing is written', async () => {
+      const port = await reporting()
+      const reply = await untilClosed(
+        port,
+        `GET /ok HTTP/1.1\r\n${host()}\r\nGET /\xc3\xa9 HTTP/1.1\r\n${host()}\r\n`,
+      )
+      expect(reply).not.toContain(' 400 ')
+      // The line the parser stopped in, not the packet's first.
+      expect(denied.map(d => d.url)).toEqual([
+        `https://${UPSTREAM_NAME}:${tlsPort}/%C3%A9`,
+      ])
+    })
+
+    test('a client that goes away in the middle of a head is no refusal', async () => {
+      const port = await reporting()
+      const error = spyOn(console, 'error').mockImplementation(() => {})
+      process.env.SRT_DEBUG = '1'
+      try {
+        const tls = await tunnel(port)
+        tls.on('error', () => {})
+        tls.write(`GET /a HTTP/1.1\r\n${host()}X: `)
+        await new Promise(r => setTimeout(r, 50))
+        tls.destroy()
+        await new Promise(r => setTimeout(r, 100))
+        // The server was told, so this is the path that reports nothing.
+        expect(error.mock.calls.flat().join('\n')).toContain(
+          '[tls-terminate] client connection error',
+        )
+      } finally {
+        delete process.env.SRT_DEBUG
+        error.mockRestore()
+      }
+      expect(denied).toEqual([])
+    })
+
+    test('one answer and one report, whatever follows', async () => {
+      const port = await reporting()
+      const bad = `GET /\xc3\xa9 HTTP/1.1\r\n${host()}\r\n`
+      const reply = await untilClosed(port, bad + bad, bad, bad)
+      expect(reply.match(/HTTP\/1\.1 /g)).toHaveLength(1)
+      expect(denied).toHaveLength(1)
+    })
+  })
 
   test('a refused upload does not keep its tunnel', async () => {
     const tls = await tunnel(hookPort.default)
@@ -683,6 +930,19 @@ describe('request target forwarding', () => {
           )
         },
       )
+
+      test.each([undefined, 'asSpelled', 'normalize'] as const)(
+        '%p: a fragment is in neither the path sent nor the path signed',
+        async mode => {
+          const reply = await sendSigned(
+            await resigning(mode),
+            '/k.txt#f',
+            FAKE,
+          )
+          expect(reply.forwarded).toBe('/k.txt')
+          expect(receivedAuthorization()).toBe(authorizationFor('/k.txt', REAL))
+        },
+      )
     })
   })
 
@@ -787,13 +1047,31 @@ describe('readRequestTarget', () => {
 
   const MODES = [undefined, 'refuse', 'asSpelled', 'normalize'] as const
 
-  test.each(FRAGMENT)('%s is refused for its fragment', raw => {
+  test.each(FRAGMENT)('%s is read as %s', (raw, left) => {
     for (const mode of MODES) {
-      expect(readRequestTarget(raw, 'GET', mode)).toEqual({
-        spelled: raw,
-        refusal:
-          'malformed request-target: a request-target has no fragment ("#")',
-      })
+      for (const origin of ['', 'http://h.test']) {
+        expect(readRequestTarget(origin + raw, 'GET', mode)).toEqual(
+          readRequestTarget(left, 'GET', mode),
+        )
+      }
+    }
+    expect(readRequestTarget(raw, 'GET').forwarded).toBe(left)
+  })
+
+  test.each(FRAGMENT_AMBIGUOUS)('%s is read as %s', (raw, left) => {
+    for (const mode of MODES) {
+      expect(readRequestTarget(raw, 'GET', mode)).toEqual(
+        readRequestTarget(left, 'GET', mode),
+      )
+    }
+    expect(readRequestTarget(raw, 'GET').ambiguous).toBe(true)
+  })
+
+  test('what the fragment holds is not read', () => {
+    for (const fragment of ['\ufffd', '\ud800', '\u00e9', ' ', '\n#']) {
+      expect(readRequestTarget(`/p?q#${fragment}`, 'GET')).toEqual(
+        readRequestTarget('/p?q', 'GET'),
+      )
     }
   })
 
@@ -802,12 +1080,13 @@ describe('readRequestTarget', () => {
     ['/a?q=\ufffd', '/a?q=%EF%BF%BD'],
     ['/\ud800', '/%EF%BF%BD'],
     ['/\udc00x', '/%EF%BF%BDx'],
-    ['/\ufffd#x', '/%EF%BF%BD#x'],
+    ['/\ufffd#x', '/%EF%BF%BD'],
   ])('%p is refused for what the runtime replaced', (raw, spelled) => {
     for (const mode of MODES) {
       expect(readRequestTarget(raw, 'GET', mode)).toEqual({
         spelled,
-        refusal: 'malformed request-target: it holds bytes that are not UTF-8',
+        refusal:
+          'malformed request-target: it holds bytes that are not UTF-8, or U+FFFD',
       })
     }
   })
@@ -824,7 +1103,8 @@ describe('readRequestTarget', () => {
     'http:/h.test/x',
     'http://h.test\\x',
     'http://h.test\\@other.test/x',
-    'http://h.test#x',
+    '#x',
+    '*#x',
     '/a b',
     '/a\tb',
     '/a\x7f',
@@ -834,6 +1114,177 @@ describe('readRequestTarget', () => {
         refusal: 'malformed request-target',
       })
     }
+  })
+
+  // What a client that leaves the fragment in sends for a URL with no path. The
+  // URL parser ends the authority at the `#` too.
+  test.each([
+    'http://h.test#x',
+    'http://h.test#x/y',
+    'http://h.test#',
+    'http://h.test#@other.test/x',
+  ])('%p is the root of its authority', raw => {
+    expect(new URL(raw).host).toBe('h.test')
+    for (const mode of MODES) {
+      expect(readRequestTarget(raw, 'GET', mode)).toEqual({
+        spelled: '/',
+        normalized: '/',
+        ambiguous: false,
+        forwarded: '/',
+        refusal: undefined,
+      })
+    }
+  })
+})
+
+describe('refuseUnparsedRequest', () => {
+  const parseError = (
+    packet: string | undefined,
+    at: number | undefined,
+    code = 'HPE_INVALID_URL',
+  ): Error =>
+    Object.assign(new Error('Parse Error: x'), {
+      code,
+      bytesParsed: at,
+      rawPacket:
+        packet === undefined ? undefined : Buffer.from(packet, 'latin1'),
+    })
+  /** What is reported of a packet the parser stopped in at `at`. */
+  const named = (packet: string | undefined, at?: number, code?: string) => {
+    const refused = refuseUnparsedRequest(
+      parseError(packet, at, code),
+      new PassThrough(),
+      false,
+    )!
+    return `${refused.method} ${refused.target}`
+  }
+
+  test('the line the parser stopped in, with nothing raw', () => {
+    expect(named('GET /\xe9 HTTP/1.1\r\nHost: h\r\n\r\n', 5)).toBe('GET /%E9')
+    expect(named('M-SEARCH /\xe9 HTTP/1.0\n', 10)).toBe('M-SEARCH /%E9')
+    expect(
+      named('GET /ok HTTP/1.1\r\n\r\nPUT /\x01<>\x80 HTTP/1.1\r\n', 25),
+    ).toBe('PUT /%01<>%80')
+  })
+
+  test('at most 200 bytes of it', () => {
+    expect(named(`GET /${'\xe9'.repeat(300)} HTTP/1.1\r\n`, 5)).toBe(
+      `GET /${'%E9'.repeat(199)}`,
+    )
+  })
+
+  test.each([
+    ['no packet', undefined, 5],
+    ['no offset', 'GET /\xe9 HTTP/1.1\r\n', undefined],
+    ['a line that began in another packet', '\xe9 HTTP/1.1\r\nHost: h\r\n', 0],
+    ['a line that ends in another packet', 'GET /\xe9', 5],
+    ['a line whose end is in another packet', 'GET /\xe9 HTTP/1.1', 5],
+    ['a method the runtime does not know', 'FROB /\xe9 HTTP/1.1\r\n', 6],
+    ['absolute form', 'GET http://o.test/\xe9 HTTP/1.1\r\n', 18],
+    ['a space in the target', 'GET /\xe9 b HTTP/1.1\r\n', 5],
+    ['another version', 'GET /\xe9 HTTP/2.0\r\n', 5],
+    ['a request line further on', '\xe9\nGET /x HTTP/1.1\r\n', 0],
+    ['a request line after the byte', '\nGET /\xe9 HTTP/1.1\r\n', 0],
+    ['two lines that end like one', 'GET /\xe9\r\nX HTTP/1.1\r\n', 5],
+    ['an offset that is no number', 'GET /\xe9 HTTP/1.1\r\n', '5' as never],
+    ['a request line further back', 'GET /x HTTP/1.1\r\nX: \xe9\r\n', 20],
+  ])('%s: nothing of the packet', (_what, packet, at) => {
+    expect(named(packet, at)).toBe('- ')
+  })
+
+  test('only where it stopped in the target', () => {
+    const packet = 'GET /x HTTP/1.1\r\nBad Name: y\r\n'
+    expect(named(packet, 5, 'HPE_INVALID_HEADER_TOKEN')).toBe('- ')
+  })
+
+  test("an error that is not the parser's ends the socket, unanswered", () => {
+    for (const code of [
+      'ECONNRESET',
+      'EPIPE',
+      'HPE_INVALID_EOF_STATE',
+      undefined,
+      7,
+    ]) {
+      for (const ended of [false, true]) {
+        const socket = new PassThrough()
+        if (ended) socket.end()
+        expect(
+          refuseUnparsedRequest(
+            Object.assign(new Error('x'), { code }),
+            socket,
+            true,
+          ),
+        ).toBeUndefined()
+        expect(socket.destroyed).toBe(true)
+        expect(socket.readableLength).toBe(0)
+      }
+    }
+  })
+
+  test('what fails the parser after a refusal is the same refusal', () => {
+    const socket = new PassThrough({ highWaterMark: 1 })
+    expect(
+      refuseUnparsedRequest(parseError('x', 0), socket, true),
+    ).toBeDefined()
+    const answer = socket.readableLength
+    const warn = spyOn(console, 'warn').mockImplementation(() => {})
+    process.env.SRT_DEBUG = '1'
+    try {
+      for (const mayAnswer of [true, false]) {
+        expect(
+          refuseUnparsedRequest(parseError('x', 0), socket, mayAnswer),
+        ).toBeUndefined()
+      }
+      expect(warn).not.toHaveBeenCalled()
+    } finally {
+      delete process.env.SRT_DEBUG
+      warn.mockRestore()
+    }
+    // The answer is still on its way out.
+    expect(socket.destroyed).toBe(false)
+    expect(socket.readableLength).toBe(answer)
+  })
+
+  test('the socket goes as soon as the answer is out', async () => {
+    const socket = new PassThrough({ autoDestroy: false })
+    socket.resume()
+    refuseUnparsedRequest(parseError('x', 0), socket, true)
+    await new Promise(r => setTimeout(r, 50))
+    expect(socket.destroyed).toBe(true)
+  })
+
+  test('no write on a socket that takes none, or where it may not answer', () => {
+    const errored = new PassThrough()
+    errored.on('error', () => {})
+    errored.destroy(new Error('x'))
+    for (const [socket, mayAnswer] of [
+      [errored, true],
+      [new PassThrough(), false],
+    ] as const) {
+      const write = spyOn(socket, 'write')
+      const end = spyOn(socket, 'end')
+      expect(
+        refuseUnparsedRequest(parseError('x', 0), socket, mayAnswer),
+      ).toBeDefined()
+      expect(write).not.toHaveBeenCalled()
+      expect(end).not.toHaveBeenCalled()
+      expect(socket.destroyed).toBe(true)
+    }
+  })
+
+  test("a reset while the answer flushes is nobody's exception", () => {
+    const socket = new PassThrough()
+    refuseUnparsedRequest(parseError('x', 0), socket, true)
+    expect(() => socket.emit('error', new Error('reset'))).not.toThrow()
+  })
+
+  test('a socket whose flush never ends is destroyed all the same', async () => {
+    const stuck = new PassThrough({ highWaterMark: 1 })
+    stuck.cork()
+    refuseUnparsedRequest(parseError('x', 0), stuck, true)
+    expect(stuck.destroyed).toBe(false)
+    await new Promise(r => setTimeout(r, 1100))
+    expect(stuck.destroyed).toBe(true)
   })
 })
 
@@ -880,7 +1331,7 @@ describe('network.ambiguousRequestTarget', () => {
     seen.length = 0
     const reply = await exchange(
       socket,
-      `GET http://u:p@127.0.0.1:${port}/a/../b?k=SECRET HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
+      `GET http://u:SECRET@127.0.0.1:${port}/a/../b?k=SECRET#SECRET HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
         `Proxy-Authorization: Basic ${auth.toString('base64')}\r\n\r\n`,
     )
     expect(reply.status).toBe(status)
@@ -891,12 +1342,12 @@ describe('network.ambiguousRequestTarget', () => {
         ? [`deny http-request GET http://127.0.0.1:${port}/a/../b?…`]
         : [],
     )
+    expect(JSON.stringify(store.getViolations())).not.toContain('SECRET')
   })
 
   test.each([
-    ['/a#t=SECRET', '/a#…', 'a request-target has no fragment'],
-    ['/a?k=SECRET#x', '/a?…', 'a request-target has no fragment'],
-    ['/caf\xe9', '/caf%EF%BF%BD', 'bytes that are not UTF-8'],
+    ['/caf\xe9', '/caf%EF%BF%BD', 'bytes that are not UTF-8, or U+FFFD'],
+    ['/caf\xe9#t=SECRET', '/caf%EF%BF%BD', 'bytes that are not UTF-8'],
   ])('%p is recorded as %s', async (sent, shown, reason) => {
     await SandboxManager.reset()
     await SandboxManager.initialize({
@@ -929,5 +1380,53 @@ describe('network.ambiguousRequestTarget', () => {
       `deny http-request GET http://127.0.0.1:${port}${shown} (malformed request-target: `,
     )
     expect(lines[0]).toContain(reason)
+    expect(lines[0]).not.toContain('SECRET')
   })
+
+  test.each([
+    ['/caf\xc3\xa9?k=SECRET#SECRET', '/caf%C3%A9?…'],
+    ['/caf\xc3\xa9#t=SECRET', '/caf%C3%A9#…'],
+  ])(
+    'in a tunnel, %p that the parser refuses is recorded as %s',
+    async (sent, shown) => {
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: {
+          allowedDomains: ['127.0.0.1'],
+          deniedDomains: [],
+          tlsTerminate: { caCertPath: CA_CERT, caKeyPath: CA_KEY },
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+      const auth = Buffer.from(`srt:${SandboxManager.getProxyAuthToken()}`)
+      const raw = await new Promise<Socket>((resolve, reject) => {
+        const s = connect(SandboxManager.getProxyPort()!, '127.0.0.1', () =>
+          s.write(
+            `CONNECT 127.0.0.1:${port} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
+              `Proxy-Authorization: Basic ${auth.toString('base64')}\r\n\r\n`,
+          ),
+        )
+        s.once('error', reject)
+        s.once('data', () => resolve(s))
+      })
+      const tls = await new Promise<Socket>((resolve, reject) => {
+        const t = tlsConnect(
+          { socket: raw, ca: CA_PEM, checkServerIdentity: () => undefined },
+          () => resolve(t),
+        )
+        t.once('error', reject)
+      })
+      const store = SandboxManager.getSandboxViolationStore()
+      store.clear()
+      const reply = await exchange(
+        tls,
+        `GET ${sent} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`,
+      )
+      expect(reply.status).toBe(400)
+      expect(store.getViolations().map(v => v.line)).toEqual([
+        `deny http-request GET https://127.0.0.1:${port}${shown} ` +
+          '(malformed request-target: percent-encode its bytes outside printable ASCII)',
+      ])
+    },
+  )
 })

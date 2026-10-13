@@ -32,6 +32,7 @@ import type { MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
   readRequestTarget,
+  refuseUnparsedRequest,
   requestTargetAsSpelled,
   respondRefusedTarget,
   type AmbiguousRequestTarget,
@@ -403,6 +404,12 @@ export function terminateAndForward(
       maxSigv4BodyBytes,
     )
   })
+  // Responses under way on the tunnel's connection.
+  let answering = 0
+  inner.on('request', (_req, res) => {
+    answering++
+    res.once('close', () => answering--)
+  })
   inner.on('clientError', (err, sock) => {
     // Parse errors and resets on the tunnel would otherwise escalate to an
     // uncaughtException, same class as the request-stream errors handled
@@ -411,26 +418,22 @@ export function terminateAndForward(
       `[tls-terminate] client connection error for ${target.hostname}: ${err.message}`,
       { level: 'error' },
     )
-    if (
-      target.maxHeaderSize !== undefined &&
-      (err as NodeJS.ErrnoException).code === 'HPE_HEADER_OVERFLOW' &&
-      sock.writable
-    ) {
-      // A head past the caller's own limit is a request past its limits:
-      // 400, flushed before the socket goes.
-      sock.on('error', () => {})
-      const mark =
-        target.denyHeader !== undefined
-          ? `${target.denyHeader}: bad_request\r\n`
-          : ''
-      sock.end(
-        `HTTP/1.1 400 Bad Request\r\n${mark}Content-Length: 0\r\nConnection: close\r\n\r\n`,
-        () => sock.destroy(),
-      )
-      setTimeout(() => sock.destroy(), 1000).unref?.()
-      return
-    }
-    sock.destroy()
+    // A request the parser refuses is refused like any other: answered, and
+    // reported under the tunnel's own target.
+    const refused = refuseUnparsedRequest(
+      err,
+      sock,
+      answering === 0,
+      target.denyHeader !== undefined
+        ? { name: target.denyHeader, value: 'bad_request' }
+        : undefined,
+    )
+    if (refused === undefined) return
+    target.onFilterRequestDeny?.(
+      refused.method,
+      `https://${formatAuthority(target.hostname, target.port, 443)}${refused.target}`,
+      refused.reason,
+    )
   })
   inner.on('upgrade', (_req, sock) => {
     // WebSocket / non-HTTP over TLS — out of scope for now.

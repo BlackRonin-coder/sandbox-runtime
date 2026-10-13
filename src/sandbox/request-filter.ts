@@ -9,13 +9,14 @@
  */
 
 import { endRequestAfterResponse } from './emitted-connection.js'
-import type {
-  IncomingHttpHeaders,
-  IncomingMessage,
-  ServerResponse,
+import {
+  METHODS,
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+  type ServerResponse,
 } from 'node:http'
 import { isIP } from 'node:net'
-import { PassThrough, Readable } from 'node:stream'
+import { type Duplex, PassThrough, Readable } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
 import { isResolvedAddressDenied } from './resolved-address-guard.js'
 import { sanitizeDenialReason } from './sandbox-violation-store.js'
@@ -115,8 +116,8 @@ export type RequestInfo = {
   target?: { host: string; port: number }
   /**
    * The request-target in origin form (path and query) as the client
-   * spelled it, a byte outside ASCII percent-encoded. These are the bytes
-   * forwarded upstream, unless the proxy was created with
+   * spelled it, without a fragment, a byte outside ASCII percent-encoded.
+   * These are the bytes forwarded upstream, unless the proxy was created with
    * `ambiguousRequestTarget: 'normalize'`. `request.url` is a parsed URL
    * and cannot hold them: its path has dot segments resolved already. (With
    * no filterRequest configured there is no hook to judge the target: plain
@@ -566,14 +567,18 @@ const percentEncoded = (text: string): string =>
  * for:
  * - a shape normalizeRequestTarget refuses, an authority that ends elsewhere
  *   than the URL parser ends it, a space or a control character;
- * - `#`: a request-target has no fragment, no client sends one, and
- *   upstreams differ in whether it ends the path or belongs to it;
  * - bytes that are not UTF-8: a runtime that lets a byte outside ASCII
  *   through has decoded it, and has put U+FFFD for these, so what the client
- *   named is lost.
+ *   named is lost. (A U+FFFD of the client's own looks the same.)
  *
  * Bytes that are UTF-8 are spelled percent-encoded, which names the same
  * resource to every reader and is what an upstream's parser is sure to take.
+ *
+ * A `#` and what follows it are in neither form. A fragment is the client's
+ * own and no part of a request-target, but some clients leave it in the
+ * absolute form they send a proxy; upstreams differ in whether it ends the
+ * path or belongs to it, so it is cut before anything is read, judged,
+ * signed, reported or sent.
  */
 export function readRequestTarget(
   raw: string,
@@ -586,23 +591,18 @@ export function readRequestTarget(
   forwarded?: string
   refusal?: string
 } {
-  const ascii = raw.replace(/[^\0-\x7f]+/g, percentEncoded)
+  const target = raw.replace(/#.*/s, '')
+  const ascii = target.replace(/[^\0-\x7f]+/g, percentEncoded)
   const normalized = normalizeRequestTarget(ascii, method)
   let spelled = ascii.replace(/^https?:\/\/[^/?#\\]+/i, '')
   if (spelled === '' || spelled.startsWith('?')) spelled = '/' + spelled
   if (normalized === undefined || !/^(?:\*|\/[!-~]*)$/.test(spelled)) {
     return { refusal: MALFORMED_TARGET }
   }
-  if (/[\ufffd\ud800-\udfff]/u.test(raw)) {
+  if (/[\ufffd\ud800-\udfff]/u.test(target)) {
     return {
       spelled,
-      refusal: `${MALFORMED_TARGET}: it holds bytes that are not UTF-8`,
-    }
-  }
-  if (spelled.includes('#')) {
-    return {
-      spelled,
-      refusal: `${MALFORMED_TARGET}: a request-target has no fragment ("#")`,
+      refusal: `${MALFORMED_TARGET}: it holds bytes that are not UTF-8, or U+FFFD`,
     }
   }
   const [a, b] = [spelled, normalized].map(t =>
@@ -642,6 +642,92 @@ export function respondRefusedTarget(
     400,
   )
   return refusal
+}
+
+/** How many bytes of a request-target the runtime's parser refused are reported. */
+const MAX_REPORTED_TARGET_LENGTH = 200
+
+/**
+ * Handle a server's 'clientError'. A request the runtime's own parser gave
+ * up on, which no request handler gets to see, is refused: 400 with the
+ * reason on the bare socket, which ends, and a warn-level line. Returns what
+ * the caller is to report of it, as it reports a denial. Any other error (a
+ * reset, a client that left) destroys the socket, with nothing to report.
+ *
+ * Nothing is written, and the socket is destroyed, where `mayAnswer` is
+ * false (the caller's: a response to an earlier request is under way, and
+ * these bytes would land inside it) or the socket takes no write. On a
+ * socket that was ended nothing is done: bytes that follow a refused head
+ * fail the parser again while the answer is on its way out, and that is one
+ * refusal.
+ *
+ * The one thing read of the client's bytes is the request line, and only
+ * where the parser stopped inside its target and the line is whole: the
+ * method if the runtime knows it, and an origin-form target, cut, with
+ * every byte outside printable ASCII percent-encoded.
+ */
+export function refuseUnparsedRequest(
+  err: Error,
+  socket: Duplex,
+  mayAnswer: boolean,
+  mark: DenyMark = DEFAULT_DENY_TAG,
+): { method: string; target: string; reason: string } | undefined {
+  const { code, rawPacket, bytesParsed } = err as {
+    code?: unknown
+    rawPacket?: unknown
+    bytesParsed?: unknown
+  }
+  if (
+    typeof code !== 'string' ||
+    !code.startsWith('HPE_') ||
+    // The input ended in the middle of a message: the client left.
+    code === 'HPE_INVALID_EOF_STATE'
+  ) {
+    socket.destroy()
+    return undefined
+  }
+  if (socket.writableEnded) return undefined
+  const refused = {
+    method: '-',
+    target: '',
+    reason: `malformed request (${err.message})`,
+  }
+  if (code === 'HPE_INVALID_URL') {
+    refused.reason = `${MALFORMED_TARGET}: percent-encode its bytes outside printable ASCII`
+    if (Buffer.isBuffer(rawPacket) && typeof bytesParsed === 'number') {
+      const text = rawPacket.toString('latin1')
+      const line = /([A-Z-]+) (\/[^ \r\n]*) HTTP\/1\.[01]\r?\n/y
+      line.lastIndex = text.slice(0, bytesParsed).lastIndexOf('\n') + 1
+      const [, method, target] = line.exec(text) ?? []
+      if (method !== undefined && METHODS.includes(method)) {
+        refused.method = method
+        refused.target = target!
+          .slice(0, MAX_REPORTED_TARGET_LENGTH)
+          .replace(
+            /[^!-~]/g,
+            c =>
+              `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`,
+          )
+      }
+    }
+  }
+  logForDebugging(`[proxy] ${refused.reason}`, { level: 'warn' })
+  if (!mayAnswer || !socket.writable) {
+    socket.destroy()
+    return refused
+  }
+  // The peer may reset while the answer flushes.
+  socket.on('error', () => {})
+  const [name, value] = denyMarkHeader(mark)
+  socket.end(
+    'HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n' +
+      `${name}: ${value}\r\nContent-Length: ${refused.reason.length + 1}\r\n` +
+      `Connection: close\r\n\r\n${refused.reason}\n`,
+    () => socket.destroy(),
+  )
+  // A flush that never ends must not keep the socket.
+  setTimeout(() => socket.destroy(), 1000).unref?.()
+  return refused
 }
 
 /**
