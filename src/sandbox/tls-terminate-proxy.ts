@@ -32,7 +32,7 @@ import {
   decideAndRespond,
   readRequestTarget,
   requestTargetAsSpelled,
-  respondAmbiguousTarget,
+  respondRefusedTarget,
   type AmbiguousRequestTarget,
   type DenyMark,
   applyHeaderEdits,
@@ -878,19 +878,30 @@ async function forwardUpstream(
     target.denyHeader !== undefined
       ? { name: target.denyHeader, value: code }
       : undefined
+  // The tunnel target as it goes on the wire: filterRequest URL, Host, SigV4.
+  const authority = formatAuthority(target.hostname, target.port, 443)
   const read =
     filterRequest && !target.requestTargetAsSpelled
-      ? readRequestTarget(req.url ?? '/', req.method)
+      ? readRequestTarget(
+          req.url ?? '/',
+          req.method,
+          target.ambiguousRequestTarget,
+        )
       : undefined
   const path = target.requestTargetAsSpelled
     ? requestTargetAsSpelled(req.url ?? '/')
-    : filterRequest
-      ? target.ambiguousRequestTarget === 'normalize'
-        ? read?.normalized
-        : read?.spelled
+    : read
+      ? read.forwarded
       : originFormPath(req.url)
   if (path === undefined) {
-    respondDenied(res, 'malformed request-target', markFor('bad_request'), 400)
+    const why = respondRefusedTarget(res, read?.refusal, markFor('bad_request'))
+    target.onFilterRequestDeny?.(
+      req.method ?? 'GET',
+      `https://${authority}${read?.spelled ?? ''}`,
+      why,
+    )
+    // Like a denial: a body still to come must not keep the tunnel.
+    destroyAfterDenial(req, res)
     return
   }
   // RFC 9112 3.2: an HTTP/1.1 request without Host is answered 400. Not
@@ -906,23 +917,6 @@ async function forwardUpstream(
       markFor('bad_request'),
       400,
     )
-    return
-  }
-  // The tunnel target as it goes on the wire: filterRequest URL, Host, SigV4.
-  const authority = formatAuthority(target.hostname, target.port, 443)
-  if (
-    read?.ambiguous &&
-    target.ambiguousRequestTarget !== 'asSpelled' &&
-    target.ambiguousRequestTarget !== 'normalize'
-  ) {
-    const why = respondAmbiguousTarget(res, markFor('bad_request'))
-    target.onFilterRequestDeny?.(
-      req.method ?? 'GET',
-      `https://${authority}${path}`,
-      why,
-    )
-    // Like a denial: a body still to come must not keep the tunnel.
-    destroyAfterDenial(req, res)
     return
   }
   let body: Readable = req

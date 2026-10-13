@@ -19,7 +19,7 @@ import {
   decideAndRespond,
   readRequestTarget,
   requestTargetAsSpelled,
-  respondAmbiguousTarget,
+  respondRefusedTarget,
   type AmbiguousRequestTarget,
   type DenyMark,
   applyHeaderEdits,
@@ -311,7 +311,7 @@ export interface HttpProxyServerOptions {
    * ambiguous (see readRequestTarget), on both paths. `'refuse'`, the
    * default: 400 before filterRequest is asked, reported through
    * onFilterRequestDenied. `'asSpelled'`: forwarded as the client spelled
-   * it; filterRequest has to judge both forms. `'normalize'`: forwarded
+   * it; filterRequest has to hold for every reading. `'normalize'`: forwarded
    * normalized, which breaks a signature over the path and names another
    * resource to an upstream that takes the path literally.
    */
@@ -1057,39 +1057,32 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // the target as the client spelled it, hook or no hook.
       const read =
         options.filterRequest && !options.requestTargetAsSpelled
-          ? readRequestTarget(req.url!, req.method)
+          ? readRequestTarget(
+              req.url!,
+              req.method,
+              options.ambiguousRequestTarget,
+            )
           : undefined
       const requestTarget = options.requestTargetAsSpelled
         ? requestTargetAsSpelled(req.url!, { absolute: true })
-        : options.filterRequest
-          ? options.ambiguousRequestTarget === 'normalize'
-            ? read?.normalized
-            : read?.spelled
+        : read
+          ? read.forwarded
           : `${url.pathname}${url.search}`
       if (requestTarget === undefined) {
-        respondDenied(
+        const reason = respondRefusedTarget(
           res,
-          'malformed request-target',
+          read?.refusal,
           markFor('bad_request'),
-          400,
         )
-        return
-      }
-      const absUrl = `${url.protocol}//${authority}${requestTarget}`
-      if (
-        read?.ambiguous &&
-        options.ambiguousRequestTarget !== 'asSpelled' &&
-        options.ambiguousRequestTarget !== 'normalize'
-      ) {
-        const reason = respondAmbiguousTarget(res, markFor('bad_request'))
         options.onFilterRequestDenied?.({
           method: req.method ?? 'GET',
-          url: absUrl,
+          url: `${url.protocol}//${authority}${read?.spelled ?? ''}`,
           reason,
           encodedCommand: auth.encodedCommand,
         })
         return
       }
+      const absUrl = `${url.protocol}//${authority}${requestTarget}`
 
       // Per-request filter applies to plain HTTP too — otherwise a sandboxed
       // client could bypass it by using http:// where the upstream serves it.

@@ -825,14 +825,14 @@ export const NetworkConfigSchema = z.object({
     .describe(
       'While filterRequest is set: what becomes of a request whose target ' +
         'names another path once normalized than as the client spelled it ' +
-        '(a dot segment, "%2e" included, leading slashes, "\\" or "#"), so ' +
-        'that the upstream may act on another resource than the callback ' +
-        'judged. "refuse" (default): 400 before filterRequest is asked, ' +
-        'recorded as a violation. "asSpelled": forwarded as spelled; the ' +
-        'callback has to judge both forms, which it gets as requestTarget ' +
-        'and normalizedRequestTarget. "normalize": forwarded normalized, ' +
-        'which breaks a signature over the path and names another resource ' +
-        'to an upstream that takes the path literally.',
+        '(a dot segment, "%2e" included, leading slashes or "\\"), so that ' +
+        'the upstream may act on another resource than the callback judged. ' +
+        '"refuse" (default): 400 before filterRequest is asked, recorded as ' +
+        'a violation. "asSpelled": forwarded as spelled; the callback has to ' +
+        'hold for every reading of it, and gets requestTarget, ' +
+        'normalizedRequestTarget and requestTargetIsAmbiguous. "normalize": ' +
+        'forwarded normalized, which breaks a signature over the path and ' +
+        'names another resource to an upstream that takes the path literally.',
     ),
   tlsTerminate: z
     .object({

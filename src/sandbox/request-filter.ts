@@ -115,20 +115,20 @@ export type RequestInfo = {
   target?: { host: string; port: number }
   /**
    * The request-target in origin form (path and query) as the client
-   * spelled it. These are the bytes forwarded upstream, unless the proxy
-   * was created with `ambiguousRequestTarget: 'normalize'`. `request.url`
-   * is a parsed URL and cannot hold them: its path has dot segments
-   * resolved already. (With no filterRequest configured there is no hook
-   * to judge the target: plain HTTP forwards the URL-parsed path and query,
-   * and the TLS-terminated path forwards the client's bytes unchanged.)
+   * spelled it, a byte outside ASCII percent-encoded. These are the bytes
+   * forwarded upstream, unless the proxy was created with
+   * `ambiguousRequestTarget: 'normalize'`. `request.url` is a parsed URL
+   * and cannot hold them: its path has dot segments resolved already. (With
+   * no filterRequest configured there is no hook to judge the target: plain
+   * HTTP forwards the URL-parsed path and query, and the TLS-terminated
+   * path forwards the client's bytes unchanged.)
    */
   requestTarget?: string
   /**
-   * The same target normalized (see normalizeRequestTarget): what an
-   * upstream that resolves the spelling acts on, and what is forwarded
-   * under `'normalize'`. Where it names another path than `requestTarget`
-   * (only under `'asSpelled'` and `'normalize'`), a path rule has to hold
-   * for both.
+   * The same target normalized (see normalizeRequestTarget): what is
+   * forwarded under `'normalize'`, and one of the readings an upstream may
+   * make of an ambiguous spelling. `/a\b/../c` is `/a/c` here, and `/c` to
+   * an upstream that keeps the `\`.
    */
   normalizedRequestTarget?: string
   /**
@@ -542,50 +542,106 @@ export function normalizeRequestTarget(
 /** What a proxy with a filterRequest does with an ambiguous request-target. */
 export type AmbiguousRequestTarget = 'refuse' | 'asSpelled' | 'normalize'
 
+const MALFORMED_TARGET = 'malformed request-target'
+const AMBIGUOUS_TARGET =
+  'ambiguous request-target: as spelled and normalized it names different ' +
+  'paths (a dot segment, leading slashes or "\\"); nothing was forwarded ' +
+  '(network.ambiguousRequestTarget in the sandbox\'s configuration is "refuse")'
+
+const percentEncoded = (text: string): string =>
+  Buffer.from(text).toString('hex').toUpperCase().replace(/../g, '%$&')
+
 /**
  * Both forms of a request-target that a filterRequest judges: `spelled`, in
  * origin form as the client wrote it, and `normalized` (see
  * normalizeRequestTarget). It is `ambiguous` when the two can name different
  * resources, so that an upstream may act on another one than a policy
- * judged: a dot segment (`%2e` included), a run of leading slashes, `\` in
- * the path, or `#`. Not ambiguous, because every reader takes both forms for
- * the same resource: a character the URL parser escapes (which ones differs
- * by runtime), an empty query it drops, and the `/` an empty path becomes.
- * Undefined for a shape normalizeRequestTarget refuses, an authority that
- * ends elsewhere than the URL parser ends it, and a byte outside printable
- * ASCII (a runtime that decodes those does not send them back unchanged).
+ * judged: a dot segment (`%2e` included), a run of leading slashes, or `\`
+ * in the path. Not ambiguous, because every reader takes both forms for the
+ * same resource: a character the URL parser escapes (which ones differs by
+ * runtime), an empty query it drops, and the `/` an empty path becomes.
+ *
+ * `forwarded` is the form `mode` sends. There is none, and `refusal` says
+ * why, for an ambiguous target unless `mode` picks a form, and in every mode
+ * for:
+ * - a shape normalizeRequestTarget refuses, an authority that ends elsewhere
+ *   than the URL parser ends it, a space or a control character;
+ * - `#`: a request-target has no fragment, no client sends one, and
+ *   upstreams differ in whether it ends the path or belongs to it;
+ * - bytes that are not UTF-8: a runtime that lets a byte outside ASCII
+ *   through has decoded it, and has put U+FFFD for these, so what the client
+ *   named is lost.
+ *
+ * Bytes that are UTF-8 are spelled percent-encoded, which names the same
+ * resource to every reader and is what an upstream's parser is sure to take.
  */
 export function readRequestTarget(
   raw: string,
   method: string | undefined,
-): { spelled: string; normalized: string; ambiguous: boolean } | undefined {
-  const normalized = normalizeRequestTarget(raw, method)
-  if (normalized === undefined) return undefined
-  let spelled = raw.replace(/^https?:\/\/[^/?#\\]+/i, '')
+  mode?: AmbiguousRequestTarget,
+): {
+  spelled?: string
+  normalized?: string
+  ambiguous?: boolean
+  forwarded?: string
+  refusal?: string
+} {
+  const ascii = raw.replace(/[^\0-\x7f]+/g, percentEncoded)
+  const normalized = normalizeRequestTarget(ascii, method)
+  let spelled = ascii.replace(/^https?:\/\/[^/?#\\]+/i, '')
   if (spelled === '' || spelled.startsWith('?')) spelled = '/' + spelled
-  if (!/^(?:\*|\/[!-~]*)$/.test(spelled)) return undefined
+  if (normalized === undefined || !/^(?:\*|\/[!-~]*)$/.test(spelled)) {
+    return { refusal: MALFORMED_TARGET }
+  }
+  if (/[\ufffd\ud800-\udfff]/u.test(raw)) {
+    return {
+      spelled,
+      refusal: `${MALFORMED_TARGET}: it holds bytes that are not UTF-8`,
+    }
+  }
+  if (spelled.includes('#')) {
+    return {
+      spelled,
+      refusal: `${MALFORMED_TARGET}: a request-target has no fragment ("#")`,
+    }
+  }
   const [a, b] = [spelled, normalized].map(t =>
-    t.replace(
-      /["'<>^`{}]/g,
-      c => '%' + c.charCodeAt(0).toString(16).toUpperCase(),
-    ),
+    t.replace(/["'<>^`{}]/g, percentEncoded),
   )
-  return { spelled, normalized, ambiguous: a !== b && a !== b + '?' }
+  const ambiguous = a !== b && a !== b + '?'
+  const forwarded =
+    mode === 'normalize'
+      ? normalized
+      : mode === 'asSpelled' || !ambiguous
+        ? spelled
+        : undefined
+  return {
+    spelled,
+    normalized,
+    ambiguous,
+    forwarded,
+    refusal: forwarded === undefined ? AMBIGUOUS_TARGET : undefined,
+  }
 }
 
-const AMBIGUOUS_TARGET_REASON =
-  'ambiguous request-target: as spelled and normalized it names different ' +
-  'paths (a dot segment, leading slashes, "\\" or "#"), and ' +
-  'network.ambiguousRequestTarget is "refuse"; nothing was forwarded'
-
-/** Refuse an ambiguous request-target: 400, and the reason for `onDeny`. */
-export function respondAmbiguousTarget(
+/**
+ * Refuse a request-target: 400 and a warn-level line. Returns the reason,
+ * for the caller to report as it reports a denial.
+ */
+export function respondRefusedTarget(
   res: ServerResponse,
-  mark: DenyMark = 'ambiguous-request-target',
+  refusal = MALFORMED_TARGET,
+  mark?: DenyMark,
 ): string {
-  logForDebugging(`[proxy] ${AMBIGUOUS_TARGET_REASON}`, { level: 'warn' })
-  respondDenied(res, AMBIGUOUS_TARGET_REASON, mark, 400)
-  return AMBIGUOUS_TARGET_REASON
+  logForDebugging(`[proxy] ${refusal}`, { level: 'warn' })
+  respondDenied(
+    res,
+    refusal,
+    mark ??
+      (refusal === AMBIGUOUS_TARGET ? 'ambiguous-request-target' : undefined),
+    400,
+  )
+  return refusal
 }
 
 /**
