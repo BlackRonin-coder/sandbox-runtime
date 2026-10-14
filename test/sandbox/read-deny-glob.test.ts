@@ -523,8 +523,12 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
       tail = '**/secrets/**',
     ): string[] {
       const spies = (['statSync', 'realpathSync'] as const).map(fn => {
-        const call = fs[fn] as (...args: unknown[]) => unknown
-        return spyOn(fs, fn).mockImplementation(((
+        // The real path is asked of the `native` form.
+        const [holder, name] = (
+          fn === 'realpathSync' ? [fs.realpathSync, 'native'] : [fs, fn]
+        ) as [Record<string, unknown>, string]
+        const call = holder[name] as (...args: unknown[]) => unknown
+        return spyOn(holder, name).mockImplementation(((
           p: unknown,
           ...rest: unknown[]
         ) => {
@@ -1790,7 +1794,7 @@ describe.if(isLinux)(
         })
       }
       const realStat = fs.statSync
-      const realRealpath = fs.realpathSync
+      const realRealpath = fs.realpathSync.native
       const spies = [
         spyOn(fs, 'statSync').mockImplementation(((
           p: fs.PathLike,
@@ -1802,7 +1806,7 @@ describe.if(isLinux)(
                 p,
                 ...rest,
               )) as typeof fs.statSync),
-        spyOn(fs, 'realpathSync').mockImplementation(((
+        spyOn(fs.realpathSync, 'native').mockImplementation(((
           p: fs.PathLike,
           ...rest: unknown[]
         ) =>
@@ -1811,7 +1815,7 @@ describe.if(isLinux)(
             : (realRealpath as (...a: unknown[]) => unknown)(
                 p,
                 ...rest,
-              )) as typeof fs.realpathSync),
+              )) as typeof fs.realpathSync.native),
       ]
       try {
         const wrapped = await wrapCommandWithSandboxLinux({
