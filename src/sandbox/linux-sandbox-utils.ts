@@ -1,6 +1,6 @@
 import { quote } from '../utils/shell-quote.js'
 import { logForDebugging } from '../utils/debug.js'
-import { realPathOf } from '../utils/real-path.js'
+import { realPathOf, wayTo } from '../utils/real-path.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
@@ -77,6 +77,8 @@ export interface LinuxSandboxParams {
    */
   maskedFileStoreDir?: string
   enableWeakerNestedSandbox?: boolean
+  /** Lets the command undo the write denies: see {@link NESTED_USERNS_ENV}. */
+  allowNestedUserNamespaces?: boolean
   allowAllUnixSockets?: boolean
   binShell?: string
   ripgrepConfig?: RipgrepConfig
@@ -148,8 +150,8 @@ function findSymlinkInPath(
   return null
 }
 
-/** Bounded depth for chasing dangling symlink chains (kernel ELOOP limit). */
-const MAX_SYMLINK_RESOLUTION_DEPTH = 40
+/** As many missing names as one way is followed up from again. */
+const MAX_MISSING_NAMES_PASSED = 40
 
 /**
  * Canonicalize a deny path through symlinks before any mask or bind is
@@ -160,11 +162,24 @@ const MAX_SYMLINK_RESOLUTION_DEPTH = 40
  * directory" for relative link targets, ENOENT for absolute ones.
  *
  * Resolution: realpath when the full path exists; otherwise canonicalize the
- * deepest existing ancestor and re-join the missing components. A dangling
- * symlink along the way is chain-walked (bounded) so the deny lands where a
- * write through the link would actually create the file. Returns null when
- * the path cannot be canonicalized (e.g. a symlink cycle); callers should
- * skip such paths rather than emit a mask bwrap will reject.
+ * deepest existing ancestor and re-join the missing components.
+ *
+ * A dangling symlink along the way is followed as the kernel follows it, name
+ * by name, to the first name that is not there. What lies beyond that name is
+ * undecided, since whoever makes it decides where the way goes on. So the
+ * answer ends with it, and with the name that follows it if one does, which
+ * makes a directory of it: the caller's placeholder on the first missing
+ * component then keeps the whole way from coming about.
+ *
+ * A way that goes up again at once from the missing name is let pass by a
+ * directory put there as a placeholder. So that name goes to `alsoDenied`, to
+ * be denied for itself, and the way is followed on from where it would lead.
+ *
+ * A directory on the way that cannot be searched is the answer itself: what
+ * lies in it cannot be told, and denied whole it keeps its place and its mode.
+ *
+ * Returns null when the path cannot be canonicalized (a symlink cycle, a name
+ * that is no text). Callers fail closed on it.
  *
  * Unlike normalizePathForSandbox, this intentionally applies no
  * isSymlinkOutsideBoundary check: that check exists so allow paths can't
@@ -172,53 +187,70 @@ const MAX_SYMLINK_RESOLUTION_DEPTH = 40
  * removes access, and the mask must land on the inode that writes through
  * the symlink actually reach.
  */
-function resolveSymlinkedDenyPath(targetPath: string): string | null {
-  let current = targetPath
-  for (let i = 0; i < MAX_SYMLINK_RESOLUTION_DEPTH; i++) {
-    try {
-      return realPathOf(current)
-    } catch {
-      // Some component is missing or dangling — canonicalize manually below.
-    }
+function resolveSymlinkedDenyPath(
+  targetPath: string,
+  alsoDenied?: string[],
+): string | null {
+  try {
+    return realPathOf(targetPath)
+  } catch {
+    // Some component is missing or dangling — canonicalize manually below.
+  }
 
-    // Find the deepest ancestor that fully resolves, collecting the missing
-    // suffix components (leaf first, so unshift keeps them in path order).
-    let ancestor = current
-    const remainder: string[] = []
-    let resolvedAncestor: string | null = null
-    while (resolvedAncestor === null) {
-      const parent = path.dirname(ancestor)
-      if (parent === ancestor) {
-        return null // reached the root without resolving anything
-      }
-      remainder.unshift(path.basename(ancestor))
-      ancestor = parent
-      try {
-        resolvedAncestor = realPathOf(ancestor)
-      } catch {
-        // Keep walking up.
-      }
+  // Find the deepest ancestor that fully resolves, collecting the missing
+  // suffix components (leaf first, so unshift keeps them in path order).
+  let ancestor = targetPath
+  const remainder: string[] = []
+  let resolvedAncestor: string | null = null
+  while (resolvedAncestor === null) {
+    const parent = path.dirname(ancestor)
+    if (parent === ancestor) {
+      return null // reached the root without resolving anything
     }
-
-    // The first missing component may be a dangling symlink (lstat succeeds,
-    // realpath fails). Follow it and loop to re-canonicalize; otherwise the
-    // remainder is genuinely non-existent and the re-joined path is final.
-    const firstMissing = path.join(resolvedAncestor, remainder[0])
-    let linkTarget: string | null = null
+    remainder.unshift(path.basename(ancestor))
+    ancestor = parent
     try {
-      linkTarget = fs.readlinkSync(firstMissing)
+      resolvedAncestor = realPathOf(ancestor)
     } catch {
-      // Not a symlink — nothing left to resolve.
+      // Keep walking up.
     }
-    if (linkTarget === null) {
-      return path.join(resolvedAncestor, ...remainder)
+  }
+
+  // The first missing component may be a dangling symlink (lstat succeeds,
+  // realpath fails); otherwise the remainder is genuinely non-existent and
+  // the re-joined path is final.
+  const rejoined = path.join(resolvedAncestor, ...remainder)
+  try {
+    fs.readlinkSync(path.join(resolvedAncestor, remainder[0]))
+  } catch {
+    return rejoined // Not a symlink — nothing left to resolve.
+  }
+  let why: unknown = 'it goes up from too many names that are not there'
+  try {
+    let onward = rejoined
+    for (let i = 0; i < MAX_MISSING_NAMES_PASSED; i++) {
+      const { real, rest, notThere } = wayTo(onward)
+      if ((notThere as NodeJS.ErrnoException | undefined)?.code === 'EACCES') {
+        return real || '/'
+      }
+      const names = rest.filter(name => name !== '' && name !== '.')
+      if (names[1] !== '..') {
+        return [real, ...names.slice(0, 2)].join('/') || '/'
+      }
+      alsoDenied?.push(`${real}/${names[0]}`)
+      onward = [real, ...names.slice(2)].join('/')
     }
-    current = path.join(
-      path.resolve(path.dirname(firstMissing), linkTarget),
-      ...remainder.slice(1),
+  } catch (err) {
+    why = err
+  }
+  // Said by the pass that acts on it, not by the one that gathers.
+  if (alsoDenied === undefined) {
+    logForDebugging(
+      `[Sandbox Linux] Where a write to ${targetPath} would land cannot be settled: ${why}. The link on the way is masked instead, which can keep the sandbox from starting.`,
+      { level: 'warn' },
     )
   }
-  return null // symlink chain too long or cyclic
+  return null
 }
 
 /**
@@ -717,7 +749,9 @@ export function boundingCapabilitiesFromStatus(
  * a creator holding CAP_SETFCAP. Under the helper a uid-0 caller's command
  * therefore has a full set inside that nested namespace, which is
  * identity-mapped to the caller's uid 0, and the filesystem policy there
- * rests on the nested namespace's mount copies being locked. Without the
+ * rests on the helper's namespaces filter refusing the calls that change a
+ * mount tree: the nested namespace's locked mount copies refuse the unmount
+ * of any one of them, not the whole tree being moved aside. Without the
  * helper (`allowAllUnixSockets`, or no usable helper binary) the command runs
  * in bwrap's own namespaces and `--cap-drop ALL` is what stops it unmounting
  * a deny.
@@ -1597,6 +1631,60 @@ export async function initializeLinuxNetworkBridge(
 }
 
 /**
+ * Read by the seccomp helper, never by this process. The write denies are
+ * read-only binds, and a bind protects a path only in the mount namespace it
+ * was made in. Creating a user namespace takes no capability and gives a full
+ * set over a private copy of the mount tree, from which the binds can be
+ * detached all at once; a directory opened beforehand then reaches the denied
+ * names. So by default the helper refuses the calls with a seccomp filter and
+ * sets user.max_user_namespaces to zero in the namespace it made. `1` lifts
+ * both. A wrap with no helper gives bubblewrap --disable-userns instead.
+ */
+const NESTED_USERNS_ENV = 'SRT_ALLOW_NESTED_USERNS'
+
+/**
+ * The assignment the helper's command line starts with, so that the variable
+ * holds what the configuration says: the wrap reaches the helper through a
+ * shell, whose start-up files (BASH_ENV) could set it after bubblewrap cleared
+ * it, and an assignment before a command is made after those.
+ */
+function helperEnvironmentPrefix(allowNestedUserNamespaces: boolean): string {
+  return `${NESTED_USERNS_ENV}=${allowNestedUserNamespaces ? '1' : '0'} `
+}
+
+// Keyed by path, like the uid-0 probe. Only an answer is kept: a probe that
+// failed is made again the next time.
+const disableUsernsProbes = new Map<string, boolean>()
+
+/**
+ * Whether this bubblewrap lists --disable-userns (0.8.0 and later) and can
+ * honour it: a setuid bubblewrap refuses the option outright.
+ */
+export function bwrapCanDisableUserns(bwrap: string): boolean {
+  const cached = disableUsernsProbes.get(bwrap)
+  if (cached !== undefined) return cached
+  let can = false
+  try {
+    if ((fs.statSync(bwrap).mode & 0o4000) === 0) {
+      const help = spawnSync(bwrap, ['--help'], {
+        timeout: 5000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        encoding: 'utf8',
+      })
+      const text = `${help.stdout ?? ''}${help.stderr ?? ''}`
+      if (help.error !== undefined || text.trim() === '') return false
+      can = text.includes('--disable-userns')
+    }
+  } catch {
+    return false
+  }
+  disableUsernsProbes.set(bwrap, can)
+  return can
+}
+
+let noUsernsLimitLogged = false
+
+/**
  * Resolve how to invoke apply-seccomp: either a standalone binary path, or a
  * multicall-binary prefix that dispatches on the ARGV0 env var.
  *
@@ -2045,7 +2133,13 @@ async function generateFilesystemArgs(
       } catch (err) {
         canonical = p // vanished or unresolvable: the recorded form stands
         canonicalFormUnresolved.add(p)
-        if (!isAbsenceErrno(err)) canonicalFormGuesses.add(p)
+        if (!isAbsenceErrno(err)) {
+          canonicalFormGuesses.add(p)
+          logForDebugging(
+            `[Sandbox Linux] Where ${p} really is cannot be told, so what is mounted for it is mounted on this spelling, which bubblewrap may refuse: ${err}`,
+            { level: 'warn' },
+          )
+        }
       }
       canonicalFormCache.set(p, canonical)
     }
@@ -2513,7 +2607,7 @@ async function generateFilesystemArgs(
       if (rawPath.startsWith('/dev/')) {
         continue
       }
-      const resolvedPath = resolveSymlinkedDenyPath(rawPath)
+      const resolvedPath = resolveSymlinkedDenyPath(rawPath, denyPaths)
       if (resolvedPath === null || resolvedPath.startsWith('/dev/')) {
         continue
       }
@@ -3391,6 +3485,7 @@ export async function wrapCommandWithSandboxLinux(
     maskedFileBinds,
     maskedFileStoreDir,
     enableWeakerNestedSandbox,
+    allowNestedUserNamespaces,
     allowAllUnixSockets,
     binShell,
     ripgrepConfig = { command: 'rg' },
@@ -3470,6 +3565,9 @@ export async function wrapCommandWithSandboxLinux(
           { level: 'warn' },
         )
       } else {
+        applySeccompPrefix =
+          helperEnvironmentPrefix(allowNestedUserNamespaces === true) +
+          applySeccompPrefix
         logForDebugging(
           '[Sandbox Linux] Applying seccomp filter for Unix socket blocking',
         )
@@ -3676,6 +3774,35 @@ export async function wrapCommandWithSandboxLinux(
       // --ro-bind / / leaves /proc read-only and those writes EROFS; a
       // fresh proc mount is what an unprivileged container refuses.
       bwrapArgs.push('--bind', '/proc', '/proc')
+    }
+
+    // The caller's environment decides nothing about the command's namespaces:
+    // the variable is cleared after every other environment operation, which
+    // bubblewrap applies in argument order, and helperEnvironmentPrefix sets it.
+    bwrapArgs.push('--unsetenv', NESTED_USERNS_ENV)
+
+    // With no helper to refuse user namespaces, bubblewrap is asked to. Never
+    // beside the helper, which makes one of its own, and not under
+    // enableWeakerNestedSandbox: bubblewrap does it by writing a sysctl, and
+    // dies on the read-only /proc/sys of an unprivileged container.
+    if (
+      applySeccompPrefix === undefined &&
+      allowNestedUserNamespaces !== true
+    ) {
+      const bwrap = enableWeakerNestedSandbox
+        ? null
+        : (bwrapPath ?? whichSync('bwrap'))
+      if (bwrap !== null && bwrapCanDisableUserns(bwrap)) {
+        bwrapArgs.push('--disable-userns')
+      } else if (!noUsernsLimitLogged) {
+        noUsernsLimitLogged = true
+        logForDebugging(
+          '[Sandbox Linux] no seccomp helper in use, and bubblewrap cannot disable user namespaces ' +
+            '(needs 0.8.0 or later, not setuid, and no enableWeakerNestedSandbox) - ' +
+            'a sandboxed command that creates one can undo the write denies',
+          { level: 'warn' },
+        )
+      }
     }
 
     // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare
