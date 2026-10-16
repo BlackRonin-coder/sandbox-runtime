@@ -224,8 +224,10 @@ function duplexOverSocket(
  * reads in that socket's own buffer too, which grows by the whole upload.
  * `outbound` is the stream whose write queue holds what is on its way to
  * the client.
+ *
+ * @internal Exported for its test.
  */
-function serverTlsOn(
+export function serverTlsOn(
   socket: Duplex,
   head: Buffer,
   options: TLSSocketOptions,
@@ -242,6 +244,12 @@ function serverTlsOn(
     isServer: true,
   })
   setConsumer(tls)
+  // destroySoon() is to destroy a socket once all it was given is out. This
+  // one has finished as soon as it has written to the stream under it, long
+  // before the client has the bytes, and destroyed then it drops them. (A
+  // runtime's http server may call it after an HTTP/1.0 response.) Ended, it
+  // closes the tunnel too, after the flush. destroy() still cuts at once.
+  tls.destroySoon = () => void tls.end()
   return { tls, outbound: duplex }
 }
 
