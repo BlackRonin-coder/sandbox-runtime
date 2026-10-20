@@ -1493,7 +1493,7 @@ export function interpretWindowsWfpVerify(
     raw = JSON.parse(r.stdout) as RawWfpVerify
   } catch {
     if (rejectsAllowLoopback(r)) throw srtWinTooOld(r.stderr)
-    // Timeout is thrown as `srt_win_timeout` by `runSrtWin` before this
+    // Timeout is thrown as `srt_win_timeout` by `runSrtWinAsync` before this
     // parse; status=null here means an external signal.
     throw new WindowsSandboxError(
       'wfp_verify_unparseable',
@@ -1633,9 +1633,9 @@ export function interpretWindowsWfpVerify(
  * fires at `ALE_AUTH_CONNECT` — before any packet leaves — so an
  * active fence yields WSAEACCES immediately and a missing fence lets
  * the connect through (the kernel completes the handshake against
- * the listening socket's backlog; no event-loop tick required, so
- * the synchronous `runSrtWin` is safe). Does not require elevation
- * and does not depend on any external host.
+ * the listening socket's backlog). The event loop stays live while
+ * `srt-win` runs. Does not require elevation and does not depend on
+ * any external host.
  *
  * With `opts.allowLoopback` the connects that must be blocked go to
  * {@link WINDOWS_LOOPBACK_PROBE_PORT}, where nothing listens and only
@@ -1682,7 +1682,9 @@ export async function verifyWindowsWfpEgress(
     // even with the fence active → false `connected`).
     const [lo, hi] = opts.proxyPortRange ?? DEFAULT_WINDOWS_PROXY_PORT_RANGE
     for (let i = 0; i < 5; i++) {
-      const s = net.createServer()
+      // A connect that gets through is accepted while `srt-win` runs:
+      // drop it, and keep its errors from being uncaught.
+      const s = net.createServer(c => c.on('error', () => {}).destroy())
       s.listen(0, '127.0.0.1')
       await once(s, 'listening')
       const p = (s.address() as net.AddressInfo).port
@@ -1712,7 +1714,7 @@ export async function verifyWindowsWfpEgress(
     // 30s: first call after install may create the sandbox user's
     // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW, and
     // the runner bounds each of its connects (probe.rs).
-    const r = runSrtWin(args, {
+    const r = await runSrtWinAsync(args, {
       timeoutMs: 30_000,
       srtWin: opts.srtWin,
     })
@@ -3550,6 +3552,7 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
  * The recorded profile read grant (`srt-win profile status`): whether one
  * exists and is current, and with `paths` every path it wrote on. Throws
  * `profile_operation_in_progress` while a grant or forget is running.
+ * Blocks the event loop: prefer {@link getWindowsProfileReadStatusAsync}.
  */
 export function getWindowsProfileReadStatus(
   opts: { paths?: boolean; srtWin?: SrtWinSpawn } = {},
@@ -3562,6 +3565,22 @@ export function getWindowsProfileReadStatus(
   })
   // Asked while a grant or forget is running: the record is being
   // rewritten, and is not a run that was cut short.
+  if (raw.state === 'in_progress') {
+    throwIfRefusedBesideOthers(args, SRT_WIN_EXIT_PROFILE_BUSY, '')
+  }
+  return mapProfileStatus(raw)
+}
+
+/** Async twin of {@link getWindowsProfileReadStatus}: the event loop stays live. */
+export async function getWindowsProfileReadStatusAsync(
+  opts: { paths?: boolean; srtWin?: SrtWinSpawn } = {},
+): Promise<WindowsProfileGrantStatus> {
+  const args = ['profile', 'status']
+  if (opts.paths) args.push('--paths')
+  const raw = await runSrtWinJsonAsync<RawProfileStatus>(args, {
+    timeoutMs: 30_000,
+    srtWin: opts.srtWin,
+  })
   if (raw.state === 'in_progress') {
     throwIfRefusedBesideOthers(args, SRT_WIN_EXIT_PROFILE_BUSY, '')
   }

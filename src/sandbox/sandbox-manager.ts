@@ -89,6 +89,7 @@ import {
   type WindowsProfileGrantItem,
   type WindowsProfileGrantStatus,
   getWindowsProfileReadStatus,
+  getWindowsProfileReadStatusAsync,
   windowsProfileExclusionConflicts,
   revokeWindowsAclChecked,
   type WindowsAclRevokeResult,
@@ -1288,8 +1289,8 @@ async function initializeSteps(
       throw new WindowsSandboxError('reinstall_required', staleSetup)
     }
     // initialize() never writes or refreshes the profile read grant.
-    windowsProfileRead = 'absent'
     windowsProfileReadWarnings = []
+    let profileRead: 'granted' | 'absent' = 'absent'
     let profileExclusions: Parameters<
       typeof windowsProfileExclusionConflicts
     >[1] = { exclusions: [], ungrantedOnly: [] }
@@ -1301,7 +1302,7 @@ async function initializeSteps(
       }
       windowsCapableSrtWin.add(windowsSrtWinIdentity(srtWin))
       if (u.profileGrant) {
-        const grant = getWindowsProfileReadStatus({ srtWin })
+        const grant = await getWindowsProfileReadStatusAsync({ srtWin })
         if (grant.state !== 'none' && grant.state !== 'current') {
           throw new WindowsSandboxError(
             'profile_grant_outdated',
@@ -1317,14 +1318,16 @@ async function initializeSteps(
         }
         if (grant.state === 'current') {
           profileExclusions = grant
-          windowsProfileRead = 'granted'
+          profileRead = 'granted'
           windowsProfileReadWarnings = windowsProfileReadWarningsOf(grant)
           for (const w of windowsProfileReadWarnings) {
             logForDebugging(`[Sandbox Windows] ${w.message}`, { level: 'warn' })
           }
         }
       }
-      if (windowsProfileRead === 'absent') {
+      // Stored once known: `absent` is never reported for a granted session.
+      windowsProfileRead = profileRead
+      if (profileRead === 'absent') {
         logForDebugging(
           `[Sandbox Windows] no profile read grant: the user profile is ` +
             `not readable to sandboxed commands in this session`,
@@ -1457,6 +1460,17 @@ async function initializeSteps(
         allowProfileExclusions: override,
         srtWin,
       })
+      // Gates running revoke/restore at reset(): every session is
+      // recorded with srt-win, whatever it was given. Set before the
+      // probe, so that a reset() during it releases what was granted.
+      windowsFsStampedSet = acc
+      logForDebugging(
+        `[Sandbox Windows] fs applied: ` +
+          `${acc.grantWrite.length} grantWrite, ` +
+          `${grantRead.length} grantRead, ` +
+          `${acc.denyRead.length} denyRead, ` +
+          `${acc.denyWrite.length} denyWrite`,
+      )
       // The egress probe, under the token this session's commands
       // get; anything but a refused connect throws, and so does an
       // install whose loopback mode is not this session's. Remembered
@@ -1479,18 +1493,6 @@ async function initializeSteps(
         windowsWfpVerifiedFor = sb
         windowsWfpVerifiedLoopback = allowLoopback
       }
-      // Gates running revoke/restore at reset(): every session is
-      // recorded with srt-win, whatever it was given.
-      {
-        windowsFsStampedSet = acc
-        logForDebugging(
-          `[Sandbox Windows] fs applied: ` +
-            `${acc.grantWrite.length} grantWrite, ` +
-            `${grantRead.length} grantRead, ` +
-            `${acc.denyRead.length} denyRead, ` +
-            `${acc.denyWrite.length} denyWrite`,
-        )
-      }
       windowsFsRawInputs = rawWindowsFsInputs(runtimeConfig)
     } catch (e) {
       // Best-effort release of whatever WAS applied before the
@@ -1500,6 +1502,7 @@ async function initializeSteps(
         releaseWindowsSessionAcls(windowsFsSbUserSid, srtWin)
       }
       windowsFsSbUserSid = undefined
+      windowsFsStampedSet = undefined
       windowsProfileRead = undefined
       config = undefined
       throw e

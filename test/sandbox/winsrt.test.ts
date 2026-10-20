@@ -483,17 +483,17 @@ async function bindOutOfRange(): Promise<BoundListener> {
 // pointed at the test runner's own executable so binary resolution
 // passes its existence check on non-Windows hosts.
 /**
- * Whether `argv` is one of the `srt-win` calls that can walk a tree,
- * which the library makes without blocking: `acl grant --persistent`,
- * `acl forget`, `profile forget`.
+ * Whether `argv` is one of the `srt-win` calls a session makes without
+ * blocking: `acl grant --persistent`, `acl forget`, `profile forget`,
+ * `profile status`.
  */
-function walksATree(argv: readonly string[]): boolean {
+function madeWithoutBlocking(argv: readonly string[]): boolean {
   const own = argv.filter(a => a !== SRT_WIN_DISPATCH_ARG1)
   return (
     (own[0] === 'acl' &&
       (own[1] === 'forget' ||
         (own[1] === 'grant' && own.includes('--persistent')))) ||
-    (own[0] === 'profile' && own[1] === 'forget')
+    (own[0] === 'profile' && (own[1] === 'forget' || own[1] === 'status'))
   )
 }
 
@@ -1497,6 +1497,22 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         env: {},
         paths: [],
       }),
+      spyOn(winUtils, 'getWindowsProfileReadStatusAsync').mockResolvedValue({
+        state: 'current',
+        capabilities: SRT_WIN_CAPABILITIES,
+        notGranted: [],
+        selfClosed: [],
+        unverifiable: [],
+        unprotected: [],
+        staleAllow: [],
+        replacedFiles: [],
+        extraExclusions: [],
+        exclusions: [],
+        ungrantedOnly: [],
+        counts: { containers: 0, granted: 0, files: 0, denied: 0 },
+        env: {},
+        paths: [],
+      }),
       // One call with all four lists, recorded as the grant and stamp it stands for.
       spyOn(winUtils, 'grantWindowsAclPersistent').mockImplementation(
         async o => {
@@ -1998,7 +2014,9 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     }))
     const srtWin = resolveSrtWin({ path: process.execPath })
     await verifyWindowsWfpEgress({ target, srtWin })
-    expect(spawnSyncSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
+    // Through the async spawn: a session start must not block the event loop.
+    expect(spawnSyncSpy.mock.calls).toHaveLength(0)
+    expect(spawnSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
       [
         SRT_WIN_DISPATCH_ARG1,
         'wfp',
@@ -2022,7 +2040,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       writeRoots: ['C:\\a', 'C:\\b'],
       srtWin,
     })
-    expect(spawnSyncSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
+    expect(spawnSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
       [
         SRT_WIN_DISPATCH_ARG1,
         'wfp',
@@ -2167,6 +2185,27 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       'status',
     ])
     expect(spawnSpy.mock.calls[0][2]).toMatchObject({ windowsHide: true })
+  })
+
+  it('getWindowsProfileReadStatus{,Async}: identical argv + identical result', async () => {
+    stubSpawn(() => ({
+      status: 0,
+      stdout: JSON.stringify({ state: 'none', record_version: 1 }),
+    }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const sync = winUtils.getWindowsProfileReadStatus({ paths: true, srtWin })
+    const asyn = await winUtils.getWindowsProfileReadStatusAsync({
+      paths: true,
+      srtWin,
+    })
+    expect(asyn).toEqual(sync)
+    expect(spawnSpy.mock.calls[0][1]).toEqual(spawnSyncSpy.mock.calls[0][1])
+    expect(spawnSpy.mock.calls[0][1]).toEqual([
+      SRT_WIN_DISPATCH_ARG1,
+      'profile',
+      'status',
+      '--paths',
+    ])
   })
 
   it('getWindowsWfpStatus{,Async}: identical argv + identical result', async () => {
@@ -2824,7 +2863,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
 
   it('verifyWindowsWfpEgress: passes --target and reports every attempt separately', async () => {
     const r = await runVerify(0, verifyOut())
-    expect(spawnSyncSpy.mock.calls[0][1]).toEqual([
+    expect(spawnSpy.mock.calls[0][1]).toEqual([
       SRT_WIN_DISPATCH_ARG1,
       'wfp',
       'verify',
@@ -2853,7 +2892,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       anonymousEgress: true,
       srtWin: resolveSrtWin({ path: process.execPath }),
     })
-    expect(spawnSyncSpy.mock.calls[0][1]).toEqual([
+    expect(spawnSpy.mock.calls[0][1]).toEqual([
       SRT_WIN_DISPATCH_ARG1,
       'wfp',
       'verify',
@@ -3049,7 +3088,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
 
   it('verifyWindowsWfpEgress: allowLoopback is passed as --allow-loopback, the open-loopback attempt is reported, and the result says loopback is open', async () => {
     const r = await runOpenVerify(0, openOut())
-    expect(spawnSyncSpy.mock.calls[0][1]).toEqual([
+    expect(spawnSpy.mock.calls[0][1]).toEqual([
       SRT_WIN_DISPATCH_ARG1,
       'wfp',
       'verify',
@@ -3080,7 +3119,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
         ...off,
         srtWin: resolveSrtWin({ path: process.execPath }),
       })
-      expect(spawnSyncSpy.mock.calls[0][1]).not.toContain('--allow-loopback')
+      expect(spawnSpy.mock.calls[0][1]).not.toContain('--allow-loopback')
       expect(r.probes.openLoopback).toBeUndefined()
       expect(r.warnings).toEqual([])
       spawnSpy.mockRestore()
@@ -3191,7 +3230,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
         allowLoopback: true,
         srtWin: resolveSrtWin({ path: process.execPath }),
       })
-      const argv = spawnSyncSpy.mock.calls[0][1] as string[]
+      const argv = spawnSpy.mock.calls[0][1] as string[]
       // The proxy range is reachable with loopback closed too, so a
       // listener there would not show that loopback is open.
       expect(argv[argv.indexOf('--target') + 1]).toBe('127.0.0.1:49999')
@@ -3209,7 +3248,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       await verifyWindowsWfpEgress({
         srtWin: resolveSrtWin({ path: process.execPath }),
       })
-      const argv = spawnSyncSpy.mock.calls[0][1] as string[]
+      const argv = spawnSpy.mock.calls[0][1] as string[]
       expect(argv[argv.indexOf('--target') + 1]).toBe('127.0.0.1:49999')
       expect(servers.asked).toEqual([0, 0])
       expect(servers.closed).toEqual([60085, 49999])
@@ -3503,7 +3542,8 @@ describe('Windows write roots are granted once and kept (pure, all platforms)', 
         _exe: string,
         argv: readonly string[],
       ) => {
-        if (walksATree(argv)) return asyncChildAnsweredBySync(_exe, argv)
+        if (madeWithoutBlocking(argv))
+          return asyncChildAnsweredBySync(_exe, argv)
         const mkStream = () => {
           const s = new EventEmitter() as EventEmitter & {
             setEncoding(e: string): typeof s
@@ -3878,7 +3918,8 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
         _exe: string,
         argv: readonly string[],
       ) => {
-        if (walksATree(argv)) return asyncChildAnsweredBySync(_exe, argv)
+        if (madeWithoutBlocking(argv))
+          return asyncChildAnsweredBySync(_exe, argv)
         const mkStream = () => {
           const s = new EventEmitter() as EventEmitter & {
             setEncoding(e: string): typeof s
@@ -6614,7 +6655,8 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         _exe: string,
         argv: readonly string[],
       ) => {
-        if (walksATree(argv)) return asyncChildAnsweredBySync(_exe, argv)
+        if (madeWithoutBlocking(argv))
+          return asyncChildAnsweredBySync(_exe, argv)
         const own = argv.filter(a => a !== SRT_WIN_DISPATCH_ARG1)
         asyncCalls.push([...own])
         const mkStream = () => {
@@ -6734,8 +6776,12 @@ describe('Windows profile read grant (pure, all platforms)', () => {
 
   describe('a default session: initialize() checks the record and never writes the grant', () => {
     it('a current grant: one `profile status`, without the path list, then the session as usual', async () => {
+      // The status is read without blocking the event loop.
+      const blocking = spyOn(winUtils, 'getWindowsProfileReadStatus')
+      spies.push(blocking)
       await SandboxManager.initialize(config())
       expect(names()).toEqual(['profile status', 'acl grant'])
+      expect(blocking).not.toHaveBeenCalled()
       expect(calls[0].argv).toEqual([])
       expect(asyncCalls.some(a => a[0] === 'profile')).toBe(false)
       expect(names()).not.toContain('profile grant')
